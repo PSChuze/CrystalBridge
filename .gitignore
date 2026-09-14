@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.db
+*.log
+/lsb-server/
+tools/ffxi_bfdiff/common/blowfish.*
+tools/ffxi_bfdiff/common/md52.*
+tools/ffxi_bfdiff/harness
+*.exe
+*.o

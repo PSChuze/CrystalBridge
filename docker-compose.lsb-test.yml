@@ -1,0 +1,181 @@
+# A SECOND LandSandBoat world, for the "FINAL FANTASY XI Test Server" client
+# build (PlayOnline content id 0015). Optional: nothing in docker-compose.yml
+# needs it, and a retail-only deployment should ignore this file.
+#
+# WHY A SECOND WORLD AND NOT A SECOND HOSTNAME. `ffxi00.pol.com` (retail) and
+# `ffxi015.pol.com` (the Test Client, whose own FFXiMain.dll names it) both
+# resolve to the core stack's host: the client dials fixed ports, and the
+# core's DNS answers every redirected name with one address. The only thing
+# separating the two clients on the wire is the build they report -- 302607
+# retail, 201108 Test Server -- so `lsb/ffxi_bridge.py` peeks that at offset
+# 0x74 of the cmd-0x26 packet and routes here when it equals LSB_ALT_VER.
+#
+# BRING IT UP (its own compose project, so it never merges with the main one):
+#
+#   docker compose -f docker-compose.lsb-test.yml up -d
+#
+# then point the bridge at it by setting, in .env, and restarting `bridge`:
+#
+#   LSB_ALT_VER=201108
+#   LSB_ALT_HOST=host.docker.internal    # or this host's LAN IP
+#
+# PORTS ARE +1000 FROM RETAIL, and published on the host on purpose. The bridge
+# runs in the main project's network and this stack is its own project, so
+# they share no Docker DNS; reaching it through the host keeps either project
+# from depending on the other's network. Nothing here may take a port the main
+# stack already owns.
+#
+#   retail            here
+#   54001 view        55001
+#   54230 data (tcp)  55230
+#   54231 auth        55231
+#   54002 search      55002
+#   54230 map (udp)   55230/udp
+#   8088  world api   8089 (localhost only)
+#
+# THE MAP CHANNEL NEEDS NO BRIDGE RELAY. `zone_settings` carries a per-zone
+# `zoneport` as well as `zoneip` (LSB's sql/zone_settings.sql), and the client
+# dials whatever the 0x0B handoff advertises -- so db-zoneip below sets BOTH,
+# the client goes straight to 55230/udp, and the main bridge's map relay on
+# 54230/udp is untouched. That relay exists to make the retail world's 0x00A
+# observable; this world is simply not observed the same way.
+name: lsbtest
+
+x-dbcreds: &dbcreds
+  MARIADB_DATABASE: "${LSBTEST_DB_NAME:-xidb}"
+  MARIADB_USER: "${LSBTEST_DB_USER:-xiadmin}"
+  MARIADB_PASSWORD: "${LSBTEST_DB_PASSWORD:-change-me}"
+  MARIADB_ROOT_PASSWORD: "${LSBTEST_DB_ROOT_PASSWORD:-change-me-root}"
+
+# Same pinned LSB image as the main stack -- re-pin both together on upgrade.
+x-common: &common
+  image: ghcr.io/landsandboat/server@sha256:109c3089b7d698f311b9c43380fcf19137d90eb0ddc12f07ff1baabf4c981a44
+  environment: &common-env
+    <<: *dbcreds
+    XI_NETWORK_SQL_HOST: db
+    XI_NETWORK_SQL_PORT: "3306"
+    XI_NETWORK_ZMQ_IP: world
+    XI_NETWORK_HTTP_HOST: 0.0.0.0
+    # THE WHOLE POINT OF THIS STACK. The Test Client reports a 201108xx build
+    # (no genuine test-server patch.ver is known to survive, so 20110811_A is a
+    # convention, not a measured retail stamp). LSB compares only the first six
+    # characters, so this must agree with the bridge's LSB_ALT_VER (201108) and
+    # with what the client's patch.ver says.
+    XI_LOGIN_CLIENT_VER: "${LSBTEST_CLIENT_VER:-20110811_A}"
+    # Shown on character-select. Max 15 chars (data_session clamps it).
+    XI_MAIN_SERVER_NAME: "${LSBTEST_SERVER_NAME:-Test}"
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+      restart: true
+    db-update:
+      condition: service_completed_successfully
+  volumes:
+    - lsbtest-logs:/server/log
+
+services:
+  db:
+    image: mariadb@sha256:759869cb6f003234a95c6384cdee245b4bce7de26913fe607a8110362c0c007d
+    command: ['--character-set-server=utf8mb4', '--collation-server=utf8mb4_general_ci']
+    environment:
+      <<: *dbcreds
+    volumes:
+      - lsbtest-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 20s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  db-update:
+    <<: *common
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "/server/tools/dbtool.py", "update"]
+
+  # zoneip AND zoneport, unlike the main stack which only needs the address.
+  # Zones deliberately disabled (zoneip='') stay off.
+  db-zoneip:
+    image: mariadb@sha256:759869cb6f003234a95c6384cdee245b4bce7de26913fe607a8110362c0c007d
+    restart: "no"
+    depends_on:
+      db-update:
+        condition: service_completed_successfully
+    environment:
+      <<: *dbcreds
+      LSB_ADVERTISE_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
+      LSBTEST_MAP_PORT: "${LSBTEST_MAP_PORT:-55230}"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        mariadb -h db -u"$${MARIADB_USER}" -p"$${MARIADB_PASSWORD}" "$${MARIADB_DATABASE}"
+        -e "UPDATE zone_settings SET zoneip='$${LSB_ADVERTISE_IP}', zoneport=$${LSBTEST_MAP_PORT} WHERE zoneip <> '';"
+        && echo "zone_settings -> $${LSB_ADVERTISE_IP}:$${LSBTEST_MAP_PORT}"
+
+  connect:
+    <<: *common
+    command: ["/server/xi_connect"]
+    ports:
+      - "55001:54001"
+      - "55230:54230"
+      - "55231:54231"
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      db-update:
+        condition: service_completed_successfully
+      db-zoneip:
+        condition: service_completed_successfully
+
+  search:
+    <<: *common
+    command: ["/server/xi_search"]
+    ports:
+      - "55002:54002"
+
+  world:
+    <<: *common
+    command: ["/server/xi_world"]
+    ports:
+      - "127.0.0.1:8089:8088"   # admin API -- localhost only, never LAN-exposed
+
+  # Reuses the SAME external mesh volumes as the main stack (~570 MB), read
+  # only. They are external precisely so `down -v` cannot destroy them, and
+  # nothing here writes to them.
+  map:
+    <<: *common
+    command: ["/server/xi_map"]
+    ports:
+      - "${LSBTEST_MAP_PORT:-55230}:54230/udp"
+    volumes:
+      - lsbtest-logs:/server/log
+      - navmeshes:/server/navmeshes:ro
+      - ximeshes:/server/ximeshes:ro
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      db-update:
+        condition: service_completed_successfully
+      world:
+        condition: service_started
+      connect:
+        condition: service_started
+      search:
+        condition: service_started
+
+volumes:
+  lsbtest-db:
+  lsbtest-logs:
+  navmeshes:
+    external: true
+    name: lsb_navmeshes
+  ximeshes:
+    external: true
+    name: lsb_ximeshes

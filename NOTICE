@@ -1,0 +1,51 @@
+CrystalBridge
+=============
+
+Licensed under the GNU General Public License v3.0 (see LICENSE).
+
+Why GPL-3.0
+-----------
+Two parts of this repository are derived from, or copied verbatim from,
+LandSandBoat, which is licensed under the GNU General Public License v3.0:
+
+  * lsb/ffxi_lsb_tables.py is GENERATED from LandSandBoat's source by
+    tools/gen_ffxi_lsb_tables.py: the currency packet layouts and their
+    char_points column mapping (src/map/packets/s2c/0x113_currencies_1 and
+    0x118_currencies_2), the learned-ability and weapon-skill unlock tables
+    (sql/abilities.sql, sql/weapon_skills.sql), the quest and mission log
+    enums and structures (src/map/enums/quest_log.h, mission_log.h,
+    src/common/mmo.h, src/map/entities/char_entity.h) and the home point
+    table (scripts/globals/homepoint.lua, data/enums/zone.yaml).
+
+  * tools/ffxi_bfdiff/common/cbasetypes.h is a verbatim copy of lines 40-47
+    of LandSandBoat's src/common/cbasetypes.h, and tools/ffxi_bfdiff/harness.cpp
+    is built against LandSandBoat's unmodified blowfish.cpp and md52.cpp,
+    which are not included here (the header of harness.cpp says where to get
+    them).
+
+The rest of the repository is original work released under the same license.
+
+LandSandBoat
+------------
+LandSandBoat: https://github.com/LandSandBoat/server
+Copyright (c) the Darkstar and LandSandBoat development teams.
+Licensed under the GNU General Public License v3.0.
+
+This project does not modify LandSandBoat. docker-compose.yml runs the
+LandSandBoat team's own prebuilt container images (ghcr.io/landsandboat/server,
+pinned by digest) and the navmesh and ximesh data from their ximeshes image.
+LandSandBoat is not affiliated with this project.
+
+OpenLobby
+---------
+The bridge reads account and session data written by OpenLobby, the
+PlayOnline core reimplementation, which is a separate project under AGPL-3.0.
+No OpenLobby code is included here.
+
+Trademarks and client software
+------------------------------
+FINAL FANTASY, FINAL FANTASY XI, PlayOnline and Vana'diel are trademarks or
+registered trademarks of Square Enix Holdings Co., Ltd. This project is not
+affiliated with, endorsed by, or supported by Square Enix. No Square Enix
+code, art, data or client files are included: the FINAL FANTASY XI client and
+the PlayOnline Viewer are the user's own, legally obtained copies.

@@ -1,0 +1,291 @@
+# CrystalBridge: a LandSandBoat (FFXI) world server plus the bridge that lets a
+# PlayOnline Viewer's FFXI launch land in it. One command brings up everything:
+#
+#   cp .env.example .env      # set LSB_ADVERTISE_IP and the passwords
+#   docker compose up -d --build
+#
+# Prerequisites (README.md): the OpenLobby core stack running on this host
+# (its data volume is `openlobby_pol-data`) and the two LSB mesh volumes
+# populated once.
+#
+# CONFIG. The LSB image reads XI_{FILE}_{SETTING} env vars over its
+# settings/default/*.lua, and MARIADB_* for DB creds (its entrypoint maps them
+# to XI_NETWORK_SQL_*). Values come from .env; every credential has a
+# placeholder default ("change-me") that must be changed before anything but a
+# LAN can reach this host.
+#
+# THE MAP IP: the address the login server hands the client for the map server
+# is NOT an env var. It lives per-zone in the `zone_settings.zoneip` column,
+# set by the `db-zoneip` one-shot below to ${LSB_ADVERTISE_IP}. A wrong value
+# there is the classic "character selects, then hangs at connecting to the
+# world" failure. It must be an address the client can route to (a LAN IP,
+# never 127.0.0.1 for a client on another machine).
+
+x-dbcreds: &dbcreds
+  MARIADB_DATABASE: "${LSB_DB_NAME:-xidb}"
+  MARIADB_USER: "${LSB_DB_USER:-xiadmin}"
+  MARIADB_PASSWORD: "${LSB_DB_PASSWORD:-change-me}"
+  MARIADB_ROOT_PASSWORD: "${LSB_DB_ROOT_PASSWORD:-change-me-root}"
+
+# Everything the LSB server containers share. The image is the LSB team's own
+# prebuilt binary, pinned by digest (tag :latest, server revision 627e567 when
+# pinned). Re-pin deliberately on upgrade, and regenerate lsb/ffxi_lsb_tables.py
+# against the matching source (tools/gen_ffxi_lsb_tables.py --check).
+x-common: &common
+  image: ghcr.io/landsandboat/server@sha256:109c3089b7d698f311b9c43380fcf19137d90eb0ddc12f07ff1baabf4c981a44
+  environment: &common-env
+    <<: *dbcreds
+    XI_NETWORK_SQL_HOST: db
+    XI_NETWORK_SQL_PORT: "3306"
+    XI_NETWORK_ZMQ_IP: world
+    XI_NETWORK_HTTP_HOST: 0.0.0.0
+    # The client version LSB expects (yyyymmdd_r as the client's patch.ver
+    # spells it). Stock LSB ships a newer stamp with VER_LOCK=2, which refuses
+    # an older client with "incorrect client version" (FFXI-3331). Set this to
+    # what your client reports; the bridge logs `client build '...'` on every
+    # launch when routing is on, and LSB's own log names the mismatch.
+    XI_LOGIN_CLIENT_VER: "${LSB_CLIENT_VER:-30260703_1}"
+    # The world name the client shows on the character-select / world-list
+    # screens. LSB's default is the literal 'Nameless'. Max 15 chars --
+    # data_session clamps it and the packet field is char[16].
+    XI_MAIN_SERVER_NAME: "${LSB_SERVER_NAME:-Nameless}"
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+      restart: true
+    db-update:
+      condition: service_completed_successfully
+  volumes:
+    - lsb-logs:/server/log
+
+services:
+  db:
+    image: mariadb@sha256:759869cb6f003234a95c6384cdee245b4bce7de26913fe607a8110362c0c007d
+    command: ['--character-set-server=utf8mb4', '--collation-server=utf8mb4_general_ci']
+    environment:
+      <<: *dbcreds
+    volumes:
+      - lsb-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 20s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # One-shot schema import + migrations. `dbtool.py update` scrapes sql/ and
+  # applies it (a full import takes a minute or two on first start); the
+  # prebuilt image ships /server/.git so it needs no mounted repo.
+  # `condition: service_completed_successfully` on the servers gates them on it.
+  db-update:
+    <<: *common
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "/server/tools/dbtool.py", "update"]
+
+  # One-shot: point every enabled zone at the address clients dial for the map
+  # server. Runs after the schema exists. Idempotent. Uses the mariadb client
+  # from the same DB image. Zones intentionally disabled (zoneip='') are left off.
+  db-zoneip:
+    image: mariadb@sha256:759869cb6f003234a95c6384cdee245b4bce7de26913fe607a8110362c0c007d
+    restart: "no"
+    depends_on:
+      db-update:
+        condition: service_completed_successfully
+    environment:
+      <<: *dbcreds
+      LSB_ADVERTISE_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        mariadb -h db -u"$${MARIADB_USER}" -p"$${MARIADB_PASSWORD}" "$${MARIADB_DATABASE}"
+        -e "UPDATE zone_settings SET zoneip='$${LSB_ADVERTISE_IP}' WHERE zoneip <> '';"
+        && echo "zone_settings.zoneip set to $${LSB_ADVERTISE_IP}"
+
+  # LOGIN server: auth (54231, TLS+JSON) + data (54230/tcp) + view (54001) +
+  # conf (51220). NO host ports: the client never reaches it directly. The
+  # bridge dials all three over the compose network and publishes the two the
+  # client actually uses (54001 view, 54230 data) itself.
+  connect:
+    <<: *common
+    command: ["/server/xi_connect"]
+    environment:
+      <<: *common-env
+      # 0 accepts every client build (the default here). LSB's own default is 2:
+      # a client older than CLIENT_VER's first six characters is refused with
+      # FFXI-3331 on the client, and the PS2 client is always "older".
+      XI_LOGIN_VER_LOCK: "${LSB_VER_LOCK:-0}"
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      db-update:
+        condition: service_completed_successfully
+      db-zoneip:
+        condition: service_completed_successfully
+
+  # Search / auction house. The client dials this one directly, at
+  # SEARCH_IP:54002 as handed to it by the bridge, so the port is published.
+  search:
+    <<: *common
+    command: ["/server/xi_search"]
+    ports:
+      - "54002:54002"
+
+  # World coordinator + HTTP API (ZMQ bus on 54003 internal; HTTP 8088).
+  world:
+    <<: *common
+    command: ["/server/xi_world"]
+    ports:
+      - "127.0.0.1:8088:8088"   # admin API - localhost only, never LAN-exposed
+
+  # Zone/gameplay server. UDP 54230 (distinct from connect's TCP 54230).
+  # Needs BOTH mesh sets: navmeshes (pathfinding) AND ximeshes (zone geometry);
+  # the server aborts at init if /server/ximeshes is missing, which the LSB
+  # docker README does not mention (it documents only navmeshes).
+  map:
+    <<: *common
+    command: ["/server/xi_map"]
+    # NO host port, deliberately. The BRIDGE owns host UDP 54230 -- the address
+    # the 0x0B handoff advertises -- and relays here over the compose network so
+    # the client's world login is observable. Two processes cannot hold one host
+    # UDP port, so this must stay empty while `bridge` sets BRIDGE_MAP_PORT.
+    # Give it back (- "54230:54230/udp") only if you also clear BRIDGE_MAP_PORT.
+    ports: []
+    volumes:
+      - lsb-logs:/server/log
+      - navmeshes:/server/navmeshes
+      - ximeshes:/server/ximeshes
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      db-update:
+        condition: service_completed_successfully
+      world:
+        condition: service_started
+      connect:
+        condition: service_started
+      search:
+        condition: service_started
+
+  # THE BRIDGE. Plays xiloader's role server-side: authenticates to LSB over
+  # TLS as a per-member account, injects the session hash into every lobby
+  # packet the real client sends, translates PlayOnline Content IDs to LSB
+  # charids and back, and relays the world UDP channel to `map`. It talks to
+  # LSB over the compose network on `connect`'s INTERNAL ports and publishes
+  # the ports the client actually dials.
+  bridge:
+    build:
+      context: ./lsb
+      dockerfile: Dockerfile.bridge
+    image: crystalbridge:latest
+    environment:
+      LSB_HOST: connect
+      LSB_VIEW_PORT: "54001"
+      LSB_DATA_PORT: "54230"
+      LSB_AUTH_PORT: "54231"
+      BRIDGE_VIEW_PORT: "54001"
+      BRIDGE_DATA_PORT: "54230"
+      # The shared LSB account: the startup smoke test, and the fallback when
+      # FFXI_REQUIRE_SIGNED_IN=0. Created on first start if LSB lacks it.
+      LSB_ACCOUNT: "${LSB_ACCOUNT:-poltest}"
+      LSB_PASSWORD: "${LSB_PASSWORD:-change-me}"
+      # The search/cache address handed to the client; the same LAN IP the
+      # zones advertise, for the same reason (127.0.0.1 is wrong for any real
+      # client).
+      SEARCH_IP: "${LSB_ADVERTISE_IP:-127.0.0.1}"
+      # The core stack's data volume: accounts.db (which members hold which FFXI
+      # Content IDs) and auth-sessions.json (which member is signed in from
+      # where). The Content ID map is written HERE too, because the core's login
+      # service must read it back (its POL_FFXI_IDMAP defaults to this path).
+      POL_ACCOUNTS_DB: /data/accounts.db
+      POL_AUTH_SESSIONS: /data/auth-sessions.json
+      FFXI_IDMAP_FILE: /data/ffxi_idmap.json
+      # The bridge's own state: which LSB account each member has.
+      FFXI_ACCTMAP_FILE: /state/ffxi_accounts.json
+      # Seed for the per-member LSB passwords (derived, never stored). Set it
+      # once; changing it changes every member's LSB password.
+      FFXI_ACCT_SECRET: "${FFXI_ACCT_SECRET:-change-me}"
+      # Refuse a launch that cannot be attributed to a signed-in Viewer
+      # session, instead of guessing (a wrong guess spends someone else's
+      # Content ID). 0 falls back to the shared account: no isolation.
+      FFXI_REQUIRE_SIGNED_IN: "${FFXI_REQUIRE_SIGNED_IN:-1}"
+      # Diagnostics under /logs: raw lobby packets, and the world UDP flows
+      # (one JSON line per datagram, bounded per flow and by file count).
+      FFXI_PKT_DIR: /logs/pkt
+      FFXI_PKT_DUMP: "${FFXI_PKT_DUMP:-1}"
+      FFXI_WORLD_CAPTURE: "${FFXI_WORLD_CAPTURE:-1}"
+      # The WORLD channel. The bridge takes host UDP 54230 (the address the 0x0B
+      # handoff advertises) and relays to the map container, purely so the
+      # client's 0x00A world login is OBSERVABLE -- LSB's map logs nothing on
+      # receive and rejects silently, so without this "the client never sent it"
+      # and "the map dropped it" are indistinguishable. Nothing is rewritten.
+      BRIDGE_MAP_PORT: "54230"
+      MAP_HOST: map
+      MAP_PORT: "54230"
+      # A SECOND WORLD for the FFXI Test Server client (content 0015), routed by
+      # the build the client reports; see docker-compose.lsb-test.yml. Empty =
+      # off, every client goes to the one world above.
+      LSB_ALT_VER: "${LSB_ALT_VER:-}"
+      LSB_ALT_HOST: "${LSB_ALT_HOST:-host.docker.internal}"
+      LSB_ALT_VIEW_PORT: "${LSB_ALT_VIEW_PORT:-55001}"
+      LSB_ALT_DATA_PORT: "${LSB_ALT_DATA_PORT:-55230}"
+      LSB_ALT_AUTH_PORT: "${LSB_ALT_AUTH_PORT:-55231}"
+      # Character-import endpoint (POST /import with a polexport dump and the
+      # Viewer's session stamp). 0 disables. Needs the DB creds -- the bridge
+      # writes the LSB database directly (same plan as tools/ffxi_import.py).
+      BRIDGE_HTTP_PORT: "${BRIDGE_IMPORT_PORT:-54004}"
+      LSB_DB_HOST: db
+      LSB_DB_NAME: "${LSB_DB_NAME:-xidb}"
+      LSB_DB_USER: "${LSB_DB_USER:-xiadmin}"
+      LSB_DB_PASSWORD: "${LSB_DB_PASSWORD:-change-me}"   # must match x-dbcreds
+      PYTHONUNBUFFERED: "1"
+    extra_hosts:
+      # so LSB_ALT_HOST can name the Docker host (the second world is its own
+      # compose project and shares no network with this one)
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "54001:54001"          # lobby VIEW channel (the client dials ffxi00:54001)
+      - "54230:54230"          # lobby DATA channel
+      - "54230:54230/udp"      # world channel, relayed to `map`
+      - "54004:54004"          # character-import endpoint (BRIDGE_IMPORT_PORT)
+    volumes:
+      - pol-data:/data
+      - bridge-state:/state
+      - bridge-logs:/logs
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket;socket.create_connection(('127.0.0.1',54001),2).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      connect:
+        condition: service_started
+
+volumes:
+  lsb-db:
+  lsb-logs:
+  bridge-state:
+  bridge-logs:
+  # The OpenLobby core's data volume (its compose project is `openlobby`, its
+  # volume key `pol-data`). Shared, not copied: accounts.db and
+  # auth-sessions.json are read here, ffxi_idmap.json is written here.
+  pol-data:
+    external: true
+    name: openlobby_pol-data
+  # Both pre-populated once from ghcr.io/landsandboat/ximeshes (that image ships
+  # /navmeshes AND /ximeshes); see README.md. External so `down -v` never
+  # destroys the ~570 MB of mesh data.
+  navmeshes:
+    external: true
+    name: lsb_navmeshes
+  ximeshes:
+    external: true
+    name: lsb_ximeshes

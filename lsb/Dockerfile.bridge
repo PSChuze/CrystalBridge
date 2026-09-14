@@ -1,0 +1,25 @@
+# The bridge image. docker-compose.yml builds it from this directory and bakes
+# the code in; nothing is bind-mounted over it at runtime, so what runs is what
+# was built. The bridge proper is stdlib-only.
+FROM python:3.12-slim
+
+# pymysql: the character-import endpoint (BRIDGE_HTTP_PORT) writes the LSB
+# database directly. Without it the endpoint refuses gracefully and everything
+# else still runs.
+RUN pip install --no-cache-dir pymysql
+
+WORKDIR /app
+COPY ffxi_bridge.py /app/ffxi_bridge.py
+COPY ffxi_import_core.py /app/ffxi_import_core.py
+# Generated from LSB's own source (currency packet layouts, learned-ability
+# ids, quest log structures, home points). WITHOUT THIS the endpoint still runs
+# and still imports everything else -- it just says those pieces were skipped.
+# That is deliberate, but it also means a forgotten COPY here is a data gap
+# that only shows in the self-serve path, never in the admin import path.
+COPY ffxi_lsb_tables.py /app/ffxi_lsb_tables.py
+
+# Mutable state does NOT live in the image: the Content ID map, the account
+# map and accounts.db are on volumes (FFXI_IDMAP_FILE, FFXI_ACCTMAP_FILE,
+# POL_ACCOUNTS_DB). -u so `docker logs` sees output immediately; the bridge's
+# own diagnostics are worthless an hour late.
+ENTRYPOINT ["python", "-u", "ffxi_bridge.py"]
