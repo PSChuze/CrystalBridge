@@ -11,6 +11,7 @@ Positive control (proves the scanner can fail): python check.py --selftest
 import hashlib
 import os
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -94,12 +95,31 @@ def denied(token):
     return hashlib.sha256(SALT + token.encode()).hexdigest() in DENY_HASHES
 
 
+def git_ignored(root):
+    """The paths under `root` that git ignores (relative, OS separators), or
+    an empty set when `root` is not a work tree or git is not installed. An
+    ignored file (a local .env, a build product) can never be committed, so
+    it is not the repository's content and is not scanned."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--others", "--ignored",
+             "--exclude-standard"],
+            capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    return {os.path.normpath(p.decode("utf-8", "replace"))
+            for p in out.split(b"\0") if p}
+
+
 def scan_tree(root):
     findings = []
+    ignored = git_ignored(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
             rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            if rel in ignored:
+                continue
             if fn in SKIP_FILES and os.path.dirname(rel) == "":
                 continue
             ext = os.path.splitext(fn)[1].lower()
@@ -146,6 +166,25 @@ PLANTS = {
 }
 
 
+def _ignored_control():
+    """A finding in a gitignored file is not the repository's. Plant the same
+    address in a tracked-to-be file and in an ignored one inside a scratch
+    git repository; exactly the first must be reported. None = git missing."""
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            subprocess.run(["git", "-C", td, "init", "-q"], check=True,
+                           capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        with open(os.path.join(td, ".gitignore"), "w", encoding="utf-8") as fh:
+            fh.write(".env\n")
+        for name in (".env", "planted.py"):
+            with open(os.path.join(td, name), "w", encoding="utf-8") as fh:
+                fh.write(PLANTS["private-ip-192.168"])
+        found = {f for f, _l, k, _m in scan_tree(td) if k == "private-ip-192.168"}
+        return found == {"planted.py"}
+
+
 def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as td:
@@ -161,6 +200,16 @@ def selftest():
                 print(f"  control {kind:24} MISSED  <- scanner is broken")
                 ok = False
             os.remove(p)
+    r = _ignored_control()
+    kind = "ignored-file-skipped"
+    if r is None:
+        print(f"  control {kind:24} NOT RUN  <- git is not installed")
+        ok = False
+    elif r:
+        print(f"  control {kind:24} CAUGHT")
+    else:
+        print(f"  control {kind:24} MISSED  <- scanner is broken")
+        ok = False
     return ok
 
 
