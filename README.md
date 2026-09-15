@@ -75,6 +75,10 @@ cp .env.example .env      # set LSB_ADVERTISE_IP and change every password
 docker compose up -d --build
 ```
 
+Without building the bridge image (published to
+`ghcr.io/prettyopenlobby/crystalbridge` on every push), add the override:
+`docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d`.
+
 The first start imports LSB's schema (a minute or two; `db-update` runs
 once and exits) and points every zone at `LSB_ADVERTISE_IP`. `LSB_ADVERTISE_IP`
 must be an address the FFXI client can route to; the default 127.0.0.1 works
